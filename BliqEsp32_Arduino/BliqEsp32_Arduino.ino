@@ -25,7 +25,7 @@
 //
 //  Notificações enviadas (JSON):
 //    { "status": "OK",   "machine": "<NOME>", "remaining": <segundos> }
-//    { "status": "DONE"  }
+//    { "status": "DONE" }
 //    { "status": "ERROR", "message": "<msg>" }
 // ============================================================
 
@@ -58,15 +58,22 @@ bool wasConnected    = false;
 
 // Sessão
 bool         sessionActive  = false;
-int          activeMachine  = -1;      // índice em MACHINE_NAMES/-1 = nenhuma
+int          activeMachine  = -1;
 bool         isPaused       = false;
 int          totalMinutes   = 0;
-unsigned long sessionStart  = 0;       // millis do início da sessão
-unsigned long pauseStart    = 0;       // millis de quando pausou
-unsigned long elapsedPaused = 0;       // total de ms em pausa
+unsigned long sessionStart  = 0;
+unsigned long pauseStart    = 0;
+unsigned long elapsedPaused = 0;
 
-unsigned long lastLogTime = 0;
-#define LOG_INTERVAL_MS 10000
+// DONE periódico: reenvia até app confirmar com STOP
+bool         doneNotifyActive   = false;
+unsigned long lastDoneNotifyMs  = 0;
+#define DONE_RETRY_INTERVAL_MS  5000
+
+unsigned long lastLogTime       = 0;
+unsigned long lastAdvRestartMs  = 0;
+#define LOG_INTERVAL_MS      10000
+#define ADV_RESTART_INTERVAL 30000  // reinicia advertising a cada 30s se desconectado
 
 // ── Helpers de máquina ────────────────────────────────────────
 
@@ -93,10 +100,12 @@ int findMachine(const char* name) {
 unsigned long remainingSeconds() {
   if (!sessionActive) return 0;
   unsigned long totalMs = (unsigned long)totalMinutes * 60000UL;
-  unsigned long elapsed = millis() - sessionStart - elapsedPaused;
+  unsigned long elapsed;
   if (isPaused) {
     unsigned long pauseMs = millis() - pauseStart;
     elapsed = (millis() - sessionStart) - elapsedPaused - pauseMs;
+  } else {
+    elapsed = millis() - sessionStart - elapsedPaused;
   }
   if (elapsed >= totalMs) return 0;
   return (totalMs - elapsed) / 1000UL;
@@ -131,23 +140,49 @@ void notifyError(const char* msg) {
   notify(buf);
 }
 
+// ── Helpers ───────────────────────────────────────────────────
+
+void blinkLed(int times, int delayMs = 150) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH); delay(delayMs);
+    digitalWrite(LED_PIN, LOW);  delay(delayMs);
+  }
+}
+
+// ── Finalização da sessão ─────────────────────────────────────
+
+void endSession() {
+  deactivateAll();
+  sessionActive     = false;
+  activeMachine     = -1;
+  isPaused          = false;
+  doneNotifyActive  = true;
+  lastDoneNotifyMs  = millis();
+
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println(  "║  SESSÃO ENCERRADA — AGUARDANDO STOP  ║");
+  Serial.println(  "╚══════════════════════════════════════╝\n");
+
+  notify("{\"status\":\"DONE\"}");
+  blinkLed(5, 100);
+}
+
 // ── Lógica dos comandos ───────────────────────────────────────
 
 void cmdStart(int duration) {
   if (duration <= 0) { notifyError("duration invalido"); return; }
 
   deactivateAll();
-  totalMinutes  = duration;
-  sessionStart  = millis();
-  elapsedPaused = 0;
-  isPaused      = false;
-  activeMachine = 0; // começa com PRE_LAVAGEM
-  sessionActive = true;
-
-  activateMachine(activeMachine);
+  totalMinutes      = duration;
+  sessionStart      = millis();
+  elapsedPaused     = 0;
+  isPaused          = false;
+  activeMachine     = -1;
+  sessionActive     = true;
+  doneNotifyActive  = false;
 
   Serial.println("╔═══════════════════════════════════════╗");
-  Serial.println("║      SESSÃO INICIADA — PRE_LAVAGEM    ║");
+  Serial.println("║  SESSÃO INICIADA — AGUARDANDO SELECT  ║");
   Serial.print  ("║  Tempo total: "); Serial.print(duration); Serial.println(" min");
   Serial.println("╚═══════════════════════════════════════╝");
 
@@ -161,7 +196,6 @@ void cmdSelect(const char* machineName) {
   if (idx < 0) { notifyError("maquina desconhecida"); return; }
 
   if (isPaused) {
-    // troca a máquina mas mantém pausado
     activeMachine = idx;
     deactivateAll();
   } else {
@@ -199,11 +233,12 @@ void cmdResume() {
 
 void cmdStop() {
   deactivateAll();
-  sessionActive = false;
-  activeMachine = -1;
-  isPaused      = false;
+  sessionActive    = false;
+  activeMachine    = -1;
+  isPaused         = false;
+  doneNotifyActive = false;  // app confirmou: para de reenviar DONE
 
-  Serial.println("[CMD] STOP — sessão encerrada.");
+  Serial.println("[CMD] STOP — confirmado pelo app.");
   notify("{\"status\":\"DONE\"}");
 }
 
@@ -236,25 +271,20 @@ class MyServerCallbacks : public BLEServerCallbacks {
     Serial.println("\n╔════════════════════════════════╗");
     Serial.println(  "║  [BLE] Dispositivo CONECTADO   ║");
     Serial.println(  "╚════════════════════════════════╝\n");
+
+    // Se app reconectou e sessão já terminou: reenviar DONE imediatamente
+    if (doneNotifyActive) {
+      notify("{\"status\":\"DONE\"}");
+    }
   }
   void onDisconnect(BLEServer*) override {
     deviceConnected = false;
     wasConnected    = true;
-    // sessão continua internamente como segurança (timer de fallback)
     Serial.println("\n╔════════════════════════════════╗");
     Serial.println(  "║ [BLE] Dispositivo DESCONECTADO ║");
     Serial.println(  "╚════════════════════════════════╝\n");
   }
 };
-
-// ── Helpers ───────────────────────────────────────────────────
-
-void blinkLed(int times, int delayMs = 150) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(LED_PIN, HIGH); delay(delayMs);
-    digitalWrite(LED_PIN, LOW);  delay(delayMs);
-  }
-}
 
 void printBanner() {
   Serial.println("\n╔══════════════════════════════════════════╗");
@@ -341,39 +371,52 @@ void setup() {
 // ── Loop ──────────────────────────────────────────────────────
 
 void loop() {
-  // Re-advertising após desconexão
+  // Re-advertising imediato após desconexão
   if (wasConnected && !deviceConnected) {
     delay(500);
     BLEDevice::startAdvertising();
     wasConnected = false;
+    lastAdvRestartMs = millis();
     Serial.println("[BLE] Re-advertising iniciado...");
   }
 
-  // LED de status
+  // Re-advertising periódico enquanto desconectado (garante que o ESP32 seja encontrável)
   if (!deviceConnected) {
-    // desconectado: apagado
+    unsigned long now = millis();
+    if (now - lastAdvRestartMs >= ADV_RESTART_INTERVAL) {
+      lastAdvRestartMs = now;
+      BLEDevice::startAdvertising();
+      Serial.println("[BLE] Advertising reiniciado (keepalive)...");
+    }
+  }
+
+  // LED de status
+  if (doneNotifyActive) {
+    // Aguardando confirmação do app: pisca muito rápido
+    digitalWrite(LED_PIN, (millis() / 100) % 2);
+  } else if (!deviceConnected) {
     digitalWrite(LED_PIN, LOW);
   } else if (!sessionActive) {
-    // conectado sem sessão: fixo
     digitalWrite(LED_PIN, HIGH);
   } else if (isPaused) {
-    // pausado: pisca lento (1s)
     digitalWrite(LED_PIN, (millis() / 1000) % 2);
   } else {
-    // em andamento: pisca rápido (250ms)
     digitalWrite(LED_PIN, (millis() / 250) % 2);
   }
 
-  // Fallback: tempo esgotado no ESP32 (segurança caso BLE caia)
+  // Tempo esgotado: encerra sessão
   if (sessionActive && !isPaused && remainingSeconds() == 0) {
-    Serial.println("\n╔══════════════════════════════════════╗");
-    Serial.println(  "║  TEMPO ESGOTADO — ENCERRANDO SESSÃO  ║");
-    Serial.println(  "╚══════════════════════════════════════╝\n");
-    deactivateAll();
-    sessionActive = false;
-    activeMachine = -1;
-    if (deviceConnected) notify("{\"status\":\"DONE\"}");
-    blinkLed(5, 100);
+    endSession();
+  }
+
+  // DONE periódico: reenvia a cada 5s até app confirmar com STOP
+  if (doneNotifyActive && deviceConnected) {
+    unsigned long now = millis();
+    if (now - lastDoneNotifyMs >= DONE_RETRY_INTERVAL_MS) {
+      lastDoneNotifyMs = now;
+      notify("{\"status\":\"DONE\"}");
+      Serial.println("[BLE] Re-enviando DONE (aguardando confirmação)...");
+    }
   }
 
   // Log periódico
