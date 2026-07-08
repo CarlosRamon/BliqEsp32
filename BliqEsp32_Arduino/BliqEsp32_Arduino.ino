@@ -1,32 +1,19 @@
 // ============================================================
-//  BliqEsp32 — Terminal BLE multi-máquina para Posto de Lavagem
-//  Arduino IDE version
+//  BliqEsp32 — Terminal BLE para Posto de Lavação / Aspiração
 //
 //  Dependencias (instalar pelo Library Manager):
 //    - ArduinoJson  (by Benoit Blanchon)  versao 6.x
 //
-//  Placa: ESP32 Dev Module
-//  Board Manager URL:
-//    https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-//
-//  Pinos das máquinas (relés):
-//    PRE_LAVAGEM → GPIO 26
-//    ESPUMA      → GPIO 27
-//    ENXAGUE     → GPIO 14
-//    FINALIZAR   → GPIO 12
-//    LED status  → GPIO 2
-//
 //  Protocolo BLE — comandos recebidos (JSON):
-//    { "action": "START",  "duration": <minutos> }
-//    { "action": "SELECT", "machine": "<NOME>" }
-//    { "action": "PAUSE"  }
-//    { "action": "RESUME" }
-//    { "action": "STOP"   }
+//    { "action": "START",  "duration": <minutos> }  → inicia sessão
+//    { "action": "SELECT", "machine": "<NOME>"   }  → ativa máquina
+//    { "action": "PAUSE"                         }  → pausa máquina
+//    { "action": "RESUME"                        }  → retoma máquina
+//    { "action": "STOP"                          }  → encerra sessão
 //
-//  Notificações enviadas (JSON):
-//    { "status": "OK",   "machine": "<NOME>", "remaining": <segundos> }
-//    { "status": "DONE" }
-//    { "status": "ERROR", "message": "<msg>" }
+//  Nota: o totem é a fonte da verdade do tempo.
+//  O ESP32 mantém um timer interno apenas como segurança
+//  (desliga máquinas se BLE cair e STOP não chegar a tempo).
 // ============================================================
 
 #include <BLEDevice.h>
@@ -34,59 +21,69 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include "ESP32_CLP.h"
+#include <esp_task_wdt.h>
 
-// ── UUIDs (devem ser idênticos ao app BliqTeste) ─────────────
-#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
-#define CHARACTERISTIC_UUID "abcd1234-5678-90ab-cdef-1234567890ab"
-#define DEVICE_NAME         "ESP32_LAVAGEM"
-
-// ── Pinos ────────────────────────────────────────────────────
-#define LED_PIN 2
-#define MACHINE_COUNT 4
-
-const char* MACHINE_NAMES[MACHINE_COUNT] = {
-  "PRE_LAVAGEM", "ESPUMA", "ENXAGUE", "FINALIZAR"
+// ── UUIDs ────────────────────────────────────────────────────
+// BLE_SUFFIX = 12 hex chars cadastrados no backend como uuidEsp32
+#define BLE_SUFFIX "90e02542161b"
+#define SERVICE_UUID "00535500-0000-0000-0000-" BLE_SUFFIX
+#define CHARACTERISTIC_UUID "00435500-0000-0000-0000-" BLE_SUFFIX
+// ── Instância da biblioteca CLP ───────────────────────────────
+ESP32_CLP CLP;
+// ── Configuração das saídas  ──────────────────────────────
+#define LED_PIN 4
+#define DEVICE_NAME "CLP_" BLE_SUFFIX
+#define MACHINE_COUNT 6
+const char* MACHINE_NAMES[MACHINE_COUNT] = { "ASPIRADOR", "AR_COMPRIMIDO", "PERFUME", "PRE_LAVAGEM", "SHAMPOO", "ENXAGUE" };
+// Máscara de bits para cada relé (RELAY_x definido no .h)
+const uint8_t MACHINE_MASKS[MACHINE_COUNT] = {
+  (1 << RELAY_1),  // Aspirador  → Relé 1
+  (1 << RELAY_2),  // Sopro      → Relé 2
+  (1 << RELAY_3),   // Perfume    → Relé 3
+  (1 << RELAY_1) | (1 << RELAY_6),                   // PRE_LAVAGEM  → RL1 + RL6
+  (1 << RELAY_2) | (1 << RELAY_3) | (1 << RELAY_4),  // SHAMPOO      → RL2 + RL3 + RL4
+  (1 << RELAY_1) | (1 << RELAY_5) | (1 << RELAY_7)   // ENXAGUE      → RL1 + RL5 + RL7
 };
-const int MACHINE_PINS[MACHINE_COUNT] = { 26, 27, 14, 12 };
 
 // ── Estado global ─────────────────────────────────────────────
-BLEServer*         bleServer         = nullptr;
+BLEServer* bleServer = nullptr;
 BLECharacteristic* bleCharacteristic = nullptr;
 
 bool deviceConnected = false;
-bool wasConnected    = false;
+bool wasConnected = false;
 
 // Sessão
-bool         sessionActive  = false;
-int          activeMachine  = -1;
-bool         isPaused       = false;
-int          totalMinutes   = 0;
-unsigned long sessionStart  = 0;
-unsigned long pauseStart    = 0;
+bool sessionActive = false;
+int activeMachine = -1;
+bool isPaused = false;
+int totalSeconds = 0;
+unsigned long sessionStart = 0;
 unsigned long elapsedPaused = 0;
+unsigned long pauseStart = 0;
 
-// DONE periódico: reenvia até app confirmar com STOP
-bool         doneNotifyActive   = false;
-unsigned long lastDoneNotifyMs  = 0;
-#define DONE_RETRY_INTERVAL_MS  5000
+unsigned long lastBleActivity = 0;
+#define BLE_TIMEOUT_MS 60000
 
-unsigned long lastLogTime       = 0;
-unsigned long lastAdvRestartMs  = 0;
-#define LOG_INTERVAL_MS      10000
-#define ADV_RESTART_INTERVAL 30000  // reinicia advertising a cada 30s se desconectado
+unsigned long lastLogTime = 0;
+unsigned long lastAdvRestartMs = 0;
+#define LOG_INTERVAL_MS 10000
+#define ADV_RESTART_INTERVAL 30000
 
 // ── Helpers de máquina ────────────────────────────────────────
 
+// Desliga todos os relés via CLP (escreve 0x00 no TCA9535 Port1)
 void deactivateAll() {
-  for (int i = 0; i < MACHINE_COUNT; i++) {
-    digitalWrite(MACHINE_PINS[i], LOW);
-  }
+  CLP.write(0x00);
 }
 
+// Liga apenas os relés correspondentes à máquina selecionada
 void activateMachine(int idx) {
-  deactivateAll();
   if (idx >= 0 && idx < MACHINE_COUNT) {
-    digitalWrite(MACHINE_PINS[idx], HIGH);
+    CLP.write(MACHINE_MASKS[idx]);
+  } else {
+    deactivateAll();
   }
 }
 
@@ -99,13 +96,13 @@ int findMachine(const char* name) {
 
 unsigned long remainingSeconds() {
   if (!sessionActive) return 0;
-  unsigned long totalMs = (unsigned long)totalMinutes * 60000UL;
+  unsigned long totalMs = (unsigned long)totalSeconds * 1000UL;
+  unsigned long now = millis();
   unsigned long elapsed;
   if (isPaused) {
-    unsigned long pauseMs = millis() - pauseStart;
-    elapsed = (millis() - sessionStart) - elapsedPaused - pauseMs;
+    elapsed = (now - sessionStart) - elapsedPaused - (now - pauseStart);
   } else {
-    elapsed = millis() - sessionStart - elapsedPaused;
+    elapsed = now - sessionStart - elapsedPaused;
   }
   if (elapsed >= totalMs) return 0;
   return (totalMs - elapsed) / 1000UL;
@@ -121,19 +118,19 @@ void notify(const char* json) {
 }
 
 void notifyOk(int machineIdx) {
-  StaticJsonDocument<128> doc;
-  doc["status"]    = "OK";
-  doc["machine"]   = (machineIdx >= 0) ? MACHINE_NAMES[machineIdx] : "NONE";
+  StaticJsonDocument<160> doc;
+  doc["status"] = "OK";
+  doc["machine"] = (machineIdx >= 0) ? MACHINE_NAMES[machineIdx] : "NONE";
   doc["remaining"] = (int)remainingSeconds();
-  doc["paused"]    = isPaused;
-  char buf[128];
+  doc["paused"] = isPaused;
+  char buf[160];
   serializeJson(doc, buf);
   notify(buf);
 }
 
 void notifyError(const char* msg) {
   StaticJsonDocument<128> doc;
-  doc["status"]  = "ERROR";
+  doc["status"] = "ERROR";
   doc["message"] = msg;
   char buf[128];
   serializeJson(doc, buf);
@@ -143,75 +140,97 @@ void notifyError(const char* msg) {
 // ── Helpers ───────────────────────────────────────────────────
 
 void blinkLed(int times, int delayMs = 150) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(LED_PIN, HIGH); delay(delayMs);
-    digitalWrite(LED_PIN, LOW);  delay(delayMs);
+  for (int i = 0; i < times * 2; i++) {
+    CLP.toggleLed();
+    delay(delayMs);
   }
+  // Garante que o LED termina apagado
+  digitalWrite(LED_PIN, LOW);
 }
 
 // ── Finalização da sessão ─────────────────────────────────────
 
-void endSession() {
+void resetSession() {
   deactivateAll();
-  sessionActive     = false;
-  activeMachine     = -1;
-  isPaused          = false;
-  doneNotifyActive  = true;
-  lastDoneNotifyMs  = millis();
-
-  Serial.println("\n╔══════════════════════════════════════╗");
-  Serial.println(  "║  SESSÃO ENCERRADA — AGUARDANDO STOP  ║");
-  Serial.println(  "╚══════════════════════════════════════╝\n");
-
-  notify("{\"status\":\"DONE\"}");
-  blinkLed(5, 100);
+  sessionActive = false;
+  activeMachine = -1;
+  isPaused = false;
+  totalSeconds = 0;
 }
 
 // ── Lógica dos comandos ───────────────────────────────────────
 
 void cmdStart(int duration) {
-  if (duration <= 0) { notifyError("duration invalido"); return; }
+  if (duration <= 0) {
+    notifyError("duration invalido");
+    return;
+  }
+
+  if (sessionActive) {
+    // Heartbeat do totem — atualiza apenas o timer de segurança sem reiniciar a sessão
+    totalSeconds = duration;
+    sessionStart = millis();
+    elapsedPaused = 0;
+    Serial.print("[SYNC] Timer atualizado: ");
+    Serial.print(duration / 60);
+    Serial.print("min ");
+    Serial.print(duration % 60);
+    Serial.println("s restantes.");
+    notifyOk(activeMachine);
+    return;
+  }
 
   deactivateAll();
-  totalMinutes      = duration;
-  sessionStart      = millis();
-  elapsedPaused     = 0;
-  isPaused          = false;
-  activeMachine     = -1;
-  sessionActive     = true;
-  doneNotifyActive  = false;
+  totalSeconds = duration;
+  sessionStart = millis();
+  elapsedPaused = 0;
+  isPaused = false;
+  activeMachine = -1;
+  sessionActive = true;
 
   Serial.println("╔═══════════════════════════════════════╗");
   Serial.println("║  SESSÃO INICIADA — AGUARDANDO SELECT  ║");
-  Serial.print  ("║  Tempo total: "); Serial.print(duration); Serial.println(" min");
+  Serial.print("║  Tempo total: ");
+  Serial.print(duration / 60);
+  Serial.print("min ");
+  Serial.print(duration % 60);
+  Serial.println("s");
   Serial.println("╚═══════════════════════════════════════╝");
 
   notifyOk(activeMachine);
 }
 
 void cmdSelect(const char* machineName) {
-  if (!sessionActive) { notifyError("sessao nao ativa"); return; }
-
-  int idx = findMachine(machineName);
-  if (idx < 0) { notifyError("maquina desconhecida"); return; }
-
-  if (isPaused) {
-    activeMachine = idx;
-    deactivateAll();
-  } else {
-    activeMachine = idx;
-    activateMachine(activeMachine);
+  if (!sessionActive) {
+    notifyError("sessao nao ativa");
+    return;
   }
 
-  Serial.print("[CMD] SELECT → "); Serial.println(MACHINE_NAMES[activeMachine]);
+  int idx = findMachine(machineName);
+  if (idx < 0) {
+    notifyError("maquina desconhecida");
+    return;
+  }
+
+  activeMachine = idx;
+  if (!isPaused) activateMachine(activeMachine);
+
+  Serial.print("[CMD] SELECT → ");
+  Serial.println(MACHINE_NAMES[activeMachine]);
   notifyOk(activeMachine);
 }
 
 void cmdPause() {
-  if (!sessionActive)   { notifyError("sessao nao ativa"); return; }
-  if (isPaused)         { notifyOk(activeMachine); return; }
+  if (!sessionActive) {
+    notifyError("sessao nao ativa");
+    return;
+  }
+  if (isPaused) {
+    notifyOk(activeMachine);
+    return;
+  }
 
-  isPaused   = true;
+  isPaused = true;
   pauseStart = millis();
   deactivateAll();
 
@@ -220,8 +239,14 @@ void cmdPause() {
 }
 
 void cmdResume() {
-  if (!sessionActive)   { notifyError("sessao nao ativa"); return; }
-  if (!isPaused)        { notifyOk(activeMachine); return; }
+  if (!sessionActive) {
+    notifyError("sessao nao ativa");
+    return;
+  }
+  if (!isPaused) {
+    notifyOk(activeMachine);
+    return;
+  }
 
   elapsedPaused += millis() - pauseStart;
   isPaused = false;
@@ -232,13 +257,8 @@ void cmdResume() {
 }
 
 void cmdStop() {
-  deactivateAll();
-  sessionActive    = false;
-  activeMachine    = -1;
-  isPaused         = false;
-  doneNotifyActive = false;  // app confirmou: para de reenviar DONE
-
-  Serial.println("[CMD] STOP — confirmado pelo app.");
+  Serial.println("[CMD] STOP — encerrando sessão.");
+  resetSession();
   notify("{\"status\":\"DONE\"}");
 }
 
@@ -247,19 +267,23 @@ void cmdStop() {
 class MyCharCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* ch) override {
     String raw = ch->getValue().c_str();
-    Serial.print("[BLE] Recebido: "); Serial.println(raw);
-
+    Serial.print("[BLE] Recebido: ");
+    Serial.println(raw);
+    lastBleActivity = millis();
     StaticJsonDocument<256> doc;
-    if (deserializeJson(doc, raw)) { notifyError("JSON invalido"); return; }
+    if (deserializeJson(doc, raw)) {
+      notifyError("JSON invalido");
+      return;
+    }
 
     const char* action = doc["action"] | "UNKNOWN";
 
-    if      (strcmp(action, "START")  == 0) cmdStart(doc["duration"] | 0);
+    if (strcmp(action, "START") == 0) cmdStart(doc["duration"] | 0);
     else if (strcmp(action, "SELECT") == 0) cmdSelect(doc["machine"] | "");
-    else if (strcmp(action, "PAUSE")  == 0) cmdPause();
+    else if (strcmp(action, "PAUSE") == 0) cmdPause();
     else if (strcmp(action, "RESUME") == 0) cmdResume();
-    else if (strcmp(action, "STOP")   == 0) cmdStop();
-    else                                    notifyError("acao desconhecida");
+    else if (strcmp(action, "STOP") == 0) cmdStop();
+    else notifyError("acao desconhecida");
   }
 };
 
@@ -271,15 +295,14 @@ class MyServerCallbacks : public BLEServerCallbacks {
     Serial.println("\n╔════════════════════════════════╗");
     Serial.println(  "║  [BLE] Dispositivo CONECTADO   ║");
     Serial.println(  "╚════════════════════════════════╝\n");
-
-    // Se app reconectou e sessão já terminou: reenviar DONE imediatamente
-    if (doneNotifyActive) {
-      notify("{\"status\":\"DONE\"}");
-    }
   }
   void onDisconnect(BLEServer*) override {
     deviceConnected = false;
-    wasConnected    = true;
+    wasConnected = true;
+    if (sessionActive) {
+      resetSession();
+      Serial.println("[SEGURANÇA] BLE desconectado — sessão encerrada, máquinas desligadas.");
+    }
     Serial.println("\n╔════════════════════════════════╗");
     Serial.println(  "║ [BLE] Dispositivo DESCONECTADO ║");
     Serial.println(  "╚════════════════════════════════╝\n");
@@ -288,9 +311,10 @@ class MyServerCallbacks : public BLEServerCallbacks {
 
 void printBanner() {
   Serial.println("\n╔══════════════════════════════════════════╗");
-  Serial.println(  "║  BliqEsp32 — Posto de Lavagem            ║");
-  Serial.println(  "║  Multi-máquina BLE                       ║");
-  Serial.println(  "╚══════════════════════════════════════════╝\n");
+  Serial.print  ("║  BliqEsp32 — ");
+  Serial.print  (DEVICE_NAME);
+  Serial.println("                    ║");
+  Serial.println("╚══════════════════════════════════════════╝\n");
 }
 
 void logSessionStatus() {
@@ -302,29 +326,42 @@ void logSessionStatus() {
   const char* mName = (activeMachine >= 0) ? MACHINE_NAMES[activeMachine] : "NENHUMA";
 
   Serial.println("┌─────────────────────────────────────┐");
-  Serial.print  ("│  Máquina ativa: "); Serial.println(mName);
-  Serial.print  ("│  Restante: ");
+  Serial.print("│  Máquina ativa: ");
+  Serial.println(mName);
+  Serial.print("│  Restante: ");
   if (remMin < 10) Serial.print("0");
-  Serial.print(remMin); Serial.print(":");
+  Serial.print(remMin);
+  Serial.print(":");
   if (remSec < 10) Serial.print("0");
   Serial.println(remSec);
-  Serial.print  ("│  Status: "); Serial.println(isPaused ? "PAUSADO" : "EM ANDAMENTO");
+  Serial.print("│  Status: ");
+  Serial.println(isPaused ? "PAUSADO" : "EM ANDAMENTO");
   Serial.println("└─────────────────────────────────────┘");
 }
 
 // ── Setup ─────────────────────────────────────────────────────
 
 void setup() {
+
+
   Serial.begin(115200);
   delay(500);
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  // Inicializa a placa CLP:
+  // - Configura LED (GPIO4), INT (GPIO5), BTN (GPIO15)
+  // - TCA9535: Port0 como INPUT (entradas), Port1 como OUTPUT (relés)
+  // - Garante todos os relés desligados (write 0x00)
+  CLP.begin();
 
-  for (int i = 0; i < MACHINE_COUNT; i++) {
-    pinMode(MACHINE_PINS[i], OUTPUT);
-    digitalWrite(MACHINE_PINS[i], LOW);
-  }
+  // Watchdog Timer — versão para ESP32 Arduino Core 3.x
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 10000,   // 10 segundos para reiniciar
+    .idle_core_mask = 0,   // não monitora cores ociosos
+    .trigger_panic = true  // reinicia o ESP32 ao travar
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);  // adiciona a task atual ao watchdog
+  Serial.println("[WATCHDOG] Ativado — timeout de 10 segundos.");
 
   printBanner();
 
@@ -338,10 +375,7 @@ void setup() {
 
   bleCharacteristic = service->createCharacteristic(
     CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_READ  |
-    BLECharacteristic::PROPERTY_WRITE |
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY);
   bleCharacteristic->addDescriptor(new BLE2902());
   bleCharacteristic->setCallbacks(new MyCharCallbacks());
   bleCharacteristic->setValue("{\"status\":\"READY\"}");
@@ -356,12 +390,15 @@ void setup() {
   BLEDevice::startAdvertising();
 
   Serial.println("[BLE] Advertising iniciado — aguardando app...");
-  Serial.print  ("[BLE] Nome:               "); Serial.println(DEVICE_NAME);
-  Serial.print  ("[BLE] Service UUID:        "); Serial.println(SERVICE_UUID);
-  Serial.print  ("[BLE] Characteristic UUID: "); Serial.println(CHARACTERISTIC_UUID);
-  Serial.print  ("[BLE] Máquinas:            ");
+  Serial.print("[BLE] Nome:               ");
+  Serial.println(DEVICE_NAME);
+  Serial.print("[BLE] Service UUID:        ");
+  Serial.println(SERVICE_UUID);
+  Serial.print("[BLE] Characteristic UUID: ");
+  Serial.println(CHARACTERISTIC_UUID);
+  Serial.print("[BLE] Comandos:            ");
   for (int i = 0; i < MACHINE_COUNT; i++) {
-    Serial.print(MACHINE_NAMES[i]); Serial.print("(pin"); Serial.print(MACHINE_PINS[i]); Serial.print(") ");
+    Serial.print(MACHINE_NAMES[i]);
   }
   Serial.println();
 
@@ -371,6 +408,7 @@ void setup() {
 // ── Loop ──────────────────────────────────────────────────────
 
 void loop() {
+  esp_task_wdt_reset();  // "ainda estou vivo"
   // Re-advertising imediato após desconexão
   if (wasConnected && !deviceConnected) {
     delay(500);
@@ -380,7 +418,7 @@ void loop() {
     Serial.println("[BLE] Re-advertising iniciado...");
   }
 
-  // Re-advertising periódico enquanto desconectado (garante que o ESP32 seja encontrável)
+  // Re-advertising periódico enquanto desconectado
   if (!deviceConnected) {
     unsigned long now = millis();
     if (now - lastAdvRestartMs >= ADV_RESTART_INTERVAL) {
@@ -391,10 +429,7 @@ void loop() {
   }
 
   // LED de status
-  if (doneNotifyActive) {
-    // Aguardando confirmação do app: pisca muito rápido
-    digitalWrite(LED_PIN, (millis() / 100) % 2);
-  } else if (!deviceConnected) {
+  if (!deviceConnected) {
     digitalWrite(LED_PIN, LOW);
   } else if (!sessionActive) {
     digitalWrite(LED_PIN, HIGH);
@@ -403,20 +438,20 @@ void loop() {
   } else {
     digitalWrite(LED_PIN, (millis() / 250) % 2);
   }
-
-  // Tempo esgotado: encerra sessão
-  if (sessionActive && !isPaused && remainingSeconds() == 0) {
-    endSession();
-  }
-
-  // DONE periódico: reenvia a cada 5s até app confirmar com STOP
-  if (doneNotifyActive && deviceConnected) {
-    unsigned long now = millis();
-    if (now - lastDoneNotifyMs >= DONE_RETRY_INTERVAL_MS) {
-      lastDoneNotifyMs = now;
-      notify("{\"status\":\"DONE\"}");
-      Serial.println("[BLE] Re-enviando DONE (aguardando confirmação)...");
+  // Timeout BLE sem STOP
+  if (sessionActive && deviceConnected) {
+    if (millis() - lastBleActivity > BLE_TIMEOUT_MS) {
+      Serial.println("[SEGURANÇA] Timeout BLE — encerrando sessão.");
+      resetSession();
     }
+  }
+  // Timer de segurança: se o totem não enviar STOP a tempo, desliga as máquinas
+  if (sessionActive && !isPaused && remainingSeconds() == 0) {
+    Serial.println("\n╔══════════════════════════════════════════╗");
+    Serial.println("║  TEMPO ESGOTADO — desligando máquinas    ║");
+    Serial.println("╚══════════════════════════════════════════╝\n");
+    resetSession();
+    blinkLed(5, 100);
   }
 
   // Log periódico
