@@ -167,10 +167,16 @@ void cmdStart(int duration) {
   }
 
   if (sessionActive) {
-    // Heartbeat do totem — atualiza apenas o timer de segurança sem reiniciar a sessão
+    // Heartbeat do totem — atualiza timer e retoma se estava pausado
     totalSeconds = duration;
     sessionStart = millis();
     elapsedPaused = 0;
+    if (isPaused) {
+      isPaused = false;
+      pauseStart = 0;
+      if (activeMachine >= 0) activateMachine(activeMachine);
+      Serial.println("[SYNC] Sessão retomada via heartbeat START.");
+    }
     Serial.print("[SYNC] Timer atualizado: ");
     Serial.print(duration / 60);
     Serial.print("min ");
@@ -262,6 +268,26 @@ void cmdStop() {
   notify("{\"status\":\"DONE\"}");
 }
 
+void cmdStatus() {
+  StaticJsonDocument<200> doc;
+  doc["status"]    = "STATUS";
+  doc["active"]    = sessionActive;
+  doc["remaining"] = (int)remainingSeconds();
+  doc["machine"]   = (sessionActive && activeMachine >= 0) ? MACHINE_NAMES[activeMachine] : "NONE";
+  doc["paused"]    = isPaused;
+  char buf[200];
+  serializeJson(doc, buf);
+  notify(buf);
+  Serial.print("[STATUS] active=");
+  Serial.print(sessionActive);
+  Serial.print(" remaining=");
+  Serial.print(remainingSeconds());
+  Serial.print(" machine=");
+  Serial.print((sessionActive && activeMachine >= 0) ? MACHINE_NAMES[activeMachine] : "NONE");
+  Serial.print(" paused=");
+  Serial.println(isPaused);
+}
+
 // ── Callback de escrita na characteristic ─────────────────────
 
 class MyCharCallbacks : public BLECharacteristicCallbacks {
@@ -283,6 +309,7 @@ class MyCharCallbacks : public BLECharacteristicCallbacks {
     else if (strcmp(action, "PAUSE") == 0) cmdPause();
     else if (strcmp(action, "RESUME") == 0) cmdResume();
     else if (strcmp(action, "STOP") == 0) cmdStop();
+    else if (strcmp(action, "STATUS") == 0) cmdStatus();
     else notifyError("acao desconhecida");
   }
 };
@@ -299,9 +326,11 @@ class MyServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer*) override {
     deviceConnected = false;
     wasConnected = true;
-    if (sessionActive) {
-      resetSession();
-      Serial.println("[SEGURANÇA] BLE desconectado — sessão encerrada, máquinas desligadas.");
+    if (sessionActive && !isPaused) {
+      isPaused = true;
+      pauseStart = millis();
+      deactivateAll();
+      Serial.println("[SEGURANÇA] BLE desconectado — sessão PAUSADA, máquinas desligadas (aguardando reconexão).");
     }
     Serial.println("\n╔════════════════════════════════╗");
     Serial.println(  "║ [BLE] Dispositivo DESCONECTADO ║");
