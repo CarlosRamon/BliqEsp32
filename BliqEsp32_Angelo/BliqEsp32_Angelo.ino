@@ -30,30 +30,54 @@
 // ── UUIDs ────────────────────────────────────────────────────
 // BLE_SUFFIX = 12 hex chars cadastrados no backend como uuidEsp32
 #define BLE_SUFFIX "90e02542161b"
-#define SERVICE_UUID "00535500-0000-0000-0000-" BLE_SUFFIX
+#define SERVICE_UUID        "00535500-0000-0000-0000-" BLE_SUFFIX
 #define CHARACTERISTIC_UUID "00435500-0000-0000-0000-" BLE_SUFFIX
 
-// ── Configuração das saídas (placa Angelo — ESP32-S3) ─────────
-// LED de status: a placa Angelo não tem LED de usuário controlável;
-// GPIO 2 está livre e pode ser usado pra soldar um LED externo.
-#define LED_PIN 2
+// ── Seleção de placa alvo ─────────────────────────────────────
+// 0 = ESP32 clássico (debug/bancada) — pinos remapeados p/ não colidir
+//     com o flash interno (GPIO 6-11) nem strapping (GPIO 12).
+//     Nesta placa os relés só disparam se você ligar fios do ESP32
+//     direto nos drivers, bypassando o TCA9535.
+// 1 = Placa Angelo ESP32-S3 (produção) — pinos MCU_C1..MCU_C10.
+#define BOARD_TIPO 0
+
 #define DEVICE_NAME "CLP_" BLE_SUFFIX
 #define MACHINE_COUNT 6
-
-// Índice do relé (0-based) → GPIO na placa Angelo (MCU_C1..MCU_C10)
 #define RELAY_COUNT 10
-const uint8_t RELAY_PINS[RELAY_COUNT] = {
-  4,   // RELAY_1  → MCU_C1
-  5,   // RELAY_2  → MCU_C2
-  6,   // RELAY_3  → MCU_C3
-  7,   // RELAY_4  → MCU_C4
-  8,   // RELAY_5  → MCU_C5
-  9,   // RELAY_6  → MCU_C6
-  10,  // RELAY_7  → MCU_C7
-  11,  // RELAY_8  → MCU_C8  (reservado)
-  12,  // RELAY_9  → MCU_C9  (reservado)
-  13   // RELAY_10 → MCU_C10 (reservado)
-};
+
+#if BOARD_TIPO == 0
+  // ESP32 clássico — GPIOs seguros p/ output (evita flash 6-11, strapping 0/2/12/15, input-only 34-39)
+  #define LED_PIN 2
+  const uint8_t RELAY_PINS[RELAY_COUNT] = {
+    4,   // RELAY_1
+    5,   // RELAY_2
+    13,  // RELAY_3
+    14,  // RELAY_4
+    16,  // RELAY_5
+    17,  // RELAY_6
+    18,  // RELAY_7
+    19,  // RELAY_8  (reservado)
+    21,  // RELAY_9  (reservado)
+    22   // RELAY_10 (reservado)
+  };
+#elif BOARD_TIPO == 1
+  // Placa Angelo ESP32-S3 — GPIOs conectados aos drivers ULN2003 dos relés
+  #define LED_PIN 2
+  const uint8_t RELAY_PINS[RELAY_COUNT] = {
+    4,   // RELAY_1  → MCU_C1
+    5,   // RELAY_2  → MCU_C2
+    6,   // RELAY_3  → MCU_C3
+    7,   // RELAY_4  → MCU_C4
+    8,   // RELAY_5  → MCU_C5
+    9,   // RELAY_6  → MCU_C6
+    10,  // RELAY_7  → MCU_C7
+    11,  // RELAY_8  → MCU_C8  (reservado)
+    12,  // RELAY_9  → MCU_C9  (reservado)
+    13   // RELAY_10 → MCU_C10 (reservado)
+  };
+#else
+  #error "BOARD_TIPO invalido: use 0 (ESP32 classico) ou 1 (Angelo ESP32-S3)"
+#endif
 
 // Aliases para manter as máscaras legíveis (bit index de RELAY_PINS)
 #define RELAY_1 0
@@ -415,6 +439,7 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
 
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(1000);   // logo apos Serial.begin()
   delay(500);
 
   // Watchdog Timer — versão para ESP32 Arduino Core 3.x
