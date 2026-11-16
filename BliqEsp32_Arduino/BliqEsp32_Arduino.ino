@@ -51,8 +51,18 @@ const uint8_t MACHINE_MASKS[MACHINE_COUNT] = {
 BLEServer* bleServer = nullptr;
 BLECharacteristic* bleCharacteristic = nullptr;
 
-bool deviceConnected = false;
-bool wasConnected = false;
+// Conexão do totem, identificada pelo conn_id do Bluedroid. Um bool único não
+// basta: com duas conexões sobrepostas (a antiga ainda não derrubada e a nova
+// do totem reconectando), o onDisconnect da antiga zerava o estado da nova e a
+// ESP parava de responder ao totem por minutos.
+#define CONN_NONE 0xFFFF
+volatile uint16_t totemConnId = CONN_NONE;
+volatile esp_gatt_if_t gattsIf = ESP_GATT_IF_NONE;
+volatile bool reAdvertise = false;
+uint32_t conexoesDerrubadas = 0;   // conexões antigas fechadas ao chegar uma nova
+uint8_t ultimoMotivoDesconexao = 0; // esp_gatt_conn_reason_t da última queda do totem
+
+inline bool totemConectado() { return totemConnId != CONN_NONE; }
 
 // Sessão
 bool sessionActive = false;
@@ -110,9 +120,20 @@ unsigned long remainingSeconds() {
 
 // ── Envio de notificação ──────────────────────────────────────
 
+// Notifica só a conexão do totem. O BLECharacteristic::notify() da lib percorre
+// todas as conexões e retorna na primeira que falha: uma conexão velha que a ESP
+// ainda não derrubou impedia a resposta de chegar ao totem que acabou de conectar.
+// Payload acima de MTU-3 é truncado pela pilha, igual ao caminho da lib.
 void notify(const char* json) {
   bleCharacteristic->setValue(json);
-  if (deviceConnected) bleCharacteristic->notify();
+  uint16_t conn = totemConnId;
+  if (conn != CONN_NONE && gattsIf != ESP_GATT_IF_NONE) {
+    esp_err_t rc = esp_ble_gatts_send_indicate(
+      gattsIf, conn, bleCharacteristic->getHandle(), strlen(json), (uint8_t*)json, false);
+    if (rc != ESP_OK) {
+      Serial.printf("[BLE] Falha ao notificar conn %u: rc=%d\n", conn, rc);
+    }
+  }
   Serial.print("[BLE] Notificando: ");
   Serial.println(json);
 }
@@ -268,14 +289,39 @@ void cmdStop() {
   notify("{\"status\":\"DONE\"}");
 }
 
+const char* nomeMotivoReset(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT";
+    case ESP_RST_SW:        return "SW";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+  }
+}
+
 void cmdStatus() {
-  StaticJsonDocument<200> doc;
+  // "status" precisa ser o primeiro campo: sem MTU negociado a notificação é
+  // cortada em 20 bytes e o totem só reconhece a resposta pelo começo dela.
+  // A telemetria vai no fim e só chega inteira com MTU maior.
+  StaticJsonDocument<320> doc;
   doc["status"]    = "STATUS";
   doc["active"]    = sessionActive;
   doc["remaining"] = (int)remainingSeconds();
   doc["machine"]   = (sessionActive && activeMachine >= 0) ? MACHINE_NAMES[activeMachine] : "NONE";
   doc["paused"]    = isPaused;
-  char buf[200];
+  doc["uptime"]    = (uint32_t)(millis() / 1000UL);
+  doc["reset"]     = nomeMotivoReset(esp_reset_reason());
+  doc["heap"]      = ESP.getFreeHeap();
+  doc["conns"]     = bleServer->getConnectedCount();
+  doc["derrubadas"] = conexoesDerrubadas;
+  doc["desc"]      = ultimoMotivoDesconexao;
+  char buf[320];
   serializeJson(doc, buf);
   notify(buf);
   Serial.print("[STATUS] active=");
@@ -316,22 +362,49 @@ class MyCharCallbacks : public BLECharacteristicCallbacks {
 
 // ── Callbacks de conexão ──────────────────────────────────────
 
+// Guarda o gatts_if para o notify direto. A lib chama este handler depois do
+// dela, então ele é registrado antes de createServer() para pegar o REG_EVT.
+void capturarGattsIf(esp_gatts_cb_event_t event, esp_gatt_if_t ifc, esp_ble_gatts_cb_param_t*) {
+  if (ifc != ESP_GATT_IF_NONE && (event == ESP_GATTS_REG_EVT || gattsIf == ESP_GATT_IF_NONE)) {
+    gattsIf = ifc;
+  }
+}
+
 class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer*) override {
-    deviceConnected = true;
+  void onConnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
+    uint16_t nova = param->connect.conn_id;
+    uint16_t antiga = totemConnId;
+    totemConnId = nova;
+    // Sem isso, o timeout de 60s do loop encerrava a sessão logo na
+    // reconexão depois de uma queda longa, antes do primeiro comando chegar.
+    lastBleActivity = millis();
+    if (antiga != CONN_NONE && antiga != nova) {
+      // Só existe um totem: a conexão antiga está morta e só atrapalha.
+      conexoesDerrubadas++;
+      Serial.printf("[BLE] Nova conexão %u com a %u ainda aberta — derrubando a antiga.\n", nova, antiga);
+      s->disconnect(antiga);
+    }
     Serial.println("\n╔════════════════════════════════╗");
     Serial.println(  "║  [BLE] Dispositivo CONECTADO   ║");
     Serial.println(  "╚════════════════════════════════╝\n");
   }
-  void onDisconnect(BLEServer*) override {
-    deviceConnected = false;
-    wasConnected = true;
+  void onDisconnect(BLEServer*, esp_ble_gatts_cb_param_t* param) override {
+    uint16_t conn = param->disconnect.conn_id;
+    if (conn != totemConnId) {
+      // Queda de uma conexão já substituída: o totem atual continua conectado.
+      Serial.printf("[BLE] Conexão antiga %u encerrada (motivo 0x%02x).\n", conn, param->disconnect.reason);
+      return;
+    }
+    totemConnId = CONN_NONE;
+    ultimoMotivoDesconexao = param->disconnect.reason;
+    reAdvertise = true;
     if (sessionActive && !isPaused) {
       isPaused = true;
       pauseStart = millis();
       deactivateAll();
       Serial.println("[SEGURANÇA] BLE desconectado — sessão PAUSADA, máquinas desligadas (aguardando reconexão).");
     }
+    Serial.printf("[BLE] Motivo da desconexão: 0x%02x\n", param->disconnect.reason);
     Serial.println("\n╔════════════════════════════════╗");
     Serial.println(  "║ [BLE] Dispositivo DESCONECTADO ║");
     Serial.println(  "╚════════════════════════════════╝\n");
@@ -397,6 +470,10 @@ void setup() {
   BLEDevice::init(DEVICE_NAME);
   BLEDevice::setPower(ESP_PWR_LVL_P9);
 
+  // MTU local maior: sem isso a troca de MTU pedida pelo totem fica em 23
+  // bytes e cada notificação chega cortada em 20.
+  BLEDevice::setMTU(247);
+  BLEDevice::setCustomGattsHandler(capturarGattsIf);
   bleServer = BLEDevice::createServer();
   bleServer->setCallbacks(new MyServerCallbacks());
 
@@ -439,16 +516,16 @@ void setup() {
 void loop() {
   esp_task_wdt_reset();  // "ainda estou vivo"
   // Re-advertising imediato após desconexão
-  if (wasConnected && !deviceConnected) {
+  if (reAdvertise && !totemConectado()) {
     delay(500);
     BLEDevice::startAdvertising();
-    wasConnected = false;
+    reAdvertise = false;
     lastAdvRestartMs = millis();
     Serial.println("[BLE] Re-advertising iniciado...");
   }
 
   // Re-advertising periódico enquanto desconectado
-  if (!deviceConnected) {
+  if (!totemConectado()) {
     unsigned long now = millis();
     if (now - lastAdvRestartMs >= ADV_RESTART_INTERVAL) {
       lastAdvRestartMs = now;
@@ -458,7 +535,7 @@ void loop() {
   }
 
   // LED de status
-  if (!deviceConnected) {
+  if (!totemConectado()) {
     digitalWrite(LED_PIN, LOW);
   } else if (!sessionActive) {
     digitalWrite(LED_PIN, HIGH);
@@ -468,7 +545,7 @@ void loop() {
     digitalWrite(LED_PIN, (millis() / 250) % 2);
   }
   // Timeout BLE sem STOP
-  if (sessionActive && deviceConnected) {
+  if (sessionActive && totemConectado()) {
     if (millis() - lastBleActivity > BLE_TIMEOUT_MS) {
       Serial.println("[SEGURANÇA] Timeout BLE — encerrando sessão.");
       resetSession();
